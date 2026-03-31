@@ -1,12 +1,5 @@
 package com.crossborder.remittance.handler;
 
-import com.amazonaws.services.lambda.runtime.Context;
-import com.amazonaws.services.lambda.runtime.RequestHandler;
-import com.amazonaws.services.lambda.runtime.events.SQSEvent;
-import com.crossborder.remittance.util.CommonUtil;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -15,19 +8,25 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.UUID;
 
+import com.amazonaws.services.lambda.runtime.Context;
+import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.events.SQSEvent;
+import com.crossborder.remittance.enums.RemitTransactionStatus;
+import com.crossborder.remittance.util.CommonUtil;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 public class ComplianceEngineLambda implements RequestHandler<SQSEvent, Void> {
 
     private static final ObjectMapper mapper = new ObjectMapper();
-    //private static final String DB_URL = System.getenv("DB_URL");
-    //private static final String DB_USER = System.getenv("DB_USER");
-    //private static final String DB_PASS = System.getenv("DB_PASS");
+    private static final String DB_URL = System.getenv("DB_URL");
+    private static final String DB_USER = System.getenv("DB_USER");
+    private static final String DB_PASS = System.getenv("DB_PASS");
     
-    private static final String DB_URL = "jdbc:postgresql://localhost:5432/tax_compliance_engine";
-    private static final String DB_USER = "rakesh";
-    private static final String DB_PASS = "";
+    //private static final String DB_URL = "jdbc:postgresql://localhost:5432/tax_compliance_engine";
+    //private static final String DB_USER = "rakesh";
+    //private static final String DB_PASS = "";
     
-    //private static final BigDecimal LRS_THRESHOLD = new BigDecimal("1000000.00");
-
     @Override
     public Void handleRequest(SQSEvent event, Context context) {
         
@@ -51,7 +50,8 @@ public class ComplianceEngineLambda implements RequestHandler<SQSEvent, Void> {
                     int expectedVersion = 1;
                     boolean ledgerExists = false;
 
-                    String selectLedger = "SELECT total_remitted_amount, version FROM fy_ledgers WHERE user_id=? AND financial_year=? AND purpose_code=?";
+                    String selectLedger = "SELECT total_remitted_amount, version FROM fy_ledgers "
+                    		+ "WHERE user_id=? AND financial_year=? AND purpose_code=?";
                     try (PreparedStatement ps = conn.prepareStatement(selectLedger)) {
                         ps.setObject(1, userId);
                         ps.setString(2, financialYear);
@@ -67,12 +67,11 @@ public class ComplianceEngineLambda implements RequestHandler<SQSEvent, Void> {
                     //Calculate TCS
                     BigDecimal tcsAmount = CommonUtil.calculateTCS(currentRemitted, remitAmount, purposeCode);
                     BigDecimal totalDeduction = remitAmount.add(tcsAmount);
-
-                    //TODO -- continue from here
                     
                     // 3. Atomic Balance Deduction (Optimistic Check for Insufficient Funds)
                     // We don't need a SELECT FOR UPDATE here. We just enforce the balance check in the UPDATE itself.
-                    String updateUser = "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?";
+                    String updateUser = "UPDATE users SET account_balance = account_balance - ?, updated_at=CURRENT_TIMESTAMP"
+                    		+ " WHERE user_id = ? AND account_balance >= ?";
                     try (PreparedStatement ps = conn.prepareStatement(updateUser)) {
                         ps.setBigDecimal(1, totalDeduction);
                         ps.setObject(2, userId);
@@ -81,7 +80,8 @@ public class ComplianceEngineLambda implements RequestHandler<SQSEvent, Void> {
                         int userUpdated = ps.executeUpdate();
                         if (userUpdated == 0) {
                             // If 0 rows updated, they either don't exist or don't have enough money.
-                            updateTransactionStatus(conn, transactionId, "REJECTED_INSUFFICIENT_FUNDS");
+                        	updateTransactionStatusAndTcs(conn, transactionId, RemitTransactionStatus.REJECTED, 
+                        			"INSUFFICIENT_FUNDS",BigDecimal.ZERO);
                             conn.commit();
                             context.getLogger().log("Transaction rejected: Insufficient funds.");
                             continue; 
@@ -93,7 +93,8 @@ public class ComplianceEngineLambda implements RequestHandler<SQSEvent, Void> {
                     
                     if (ledgerExists) {
                         // Notice the crucial additions to the WHERE clause!
-                        String updateLedger = "UPDATE fy_ledgers SET total_remitted_amount=?, version=? WHERE user_id=? AND financial_year=? AND purpose_code=? AND version=?";
+                        String updateLedger = "UPDATE fy_ledgers SET total_remitted_amount=?, version=?, updated_at=CURRENT_TIMESTAMP "
+                        		+ "WHERE user_id=? AND financial_year=? AND purpose_code=? AND version=?";
                         try (PreparedStatement ps = conn.prepareStatement(updateLedger)) {
                             ps.setBigDecimal(1, newTotalRemitted);
                             ps.setInt(2, expectedVersion + 1); // Increment version
@@ -109,7 +110,8 @@ public class ComplianceEngineLambda implements RequestHandler<SQSEvent, Void> {
                             }
                         }
                     } else {
-                        String insertLedger = "INSERT INTO fy_ledgers (user_id, financial_year, purpose_code, total_remitted_amount, version) VALUES (?, ?, ?, ?, 1)";
+                        String insertLedger = "INSERT INTO fy_ledgers (user_id, financial_year, purpose_code, total_remitted_amount, version)"
+                        		+ " VALUES (?, ?, ?, ?, 1)";
                         try (PreparedStatement ps = conn.prepareStatement(insertLedger)) {
                             ps.setObject(1, userId);
                             ps.setString(2, financialYear);
@@ -125,9 +127,9 @@ public class ComplianceEngineLambda implements RequestHandler<SQSEvent, Void> {
                             throw e;
                         }
                     }
-
+                    
                     // 5. Mark Transaction as APPROVED
-                    updateTransactionStatus(conn, transactionId, "APPROVED");
+                    updateTransactionStatusAndTcs(conn, transactionId, RemitTransactionStatus.APPROVED, "",tcsAmount);
 
                     conn.commit();
                     context.getLogger().log("Successfully processed transaction: " + transactionId);
@@ -136,8 +138,10 @@ public class ComplianceEngineLambda implements RequestHandler<SQSEvent, Void> {
                     conn.rollback();
                     context.getLogger().log("Transaction aborted. Reason: " + e.getMessage());
                     
-                    // Throw to trigger the SQS 60-second retry loop!
-                    throw new RuntimeException("Triggering SQS Retry due to processing error or version conflict.", e);
+                    if(!e.getMessage().contains("incorrectly retried")) {
+                    	// Throw to trigger the SQS 60-second retry loop!
+                        throw new RuntimeException("Triggering SQS Retry due to processing error or version conflict.", e);
+                    }
                 }
             } catch (Exception e) {
                 throw new RuntimeException("Database connection/execution failure", e);
@@ -146,13 +150,32 @@ public class ComplianceEngineLambda implements RequestHandler<SQSEvent, Void> {
         return null;
     }
 
-    private void updateTransactionStatus(Connection conn, UUID transactionId, String status) throws Exception {
-        String updateTx = "UPDATE remittance_transactions SET status = ? WHERE id = ?";
-        try (PreparedStatement ps = conn.prepareStatement(updateTx)) {
-            ps.setString(1, status);
-            ps.setObject(2, transactionId);
-            ps.executeUpdate();
-        }
+    private void updateTransactionStatusAndTcs(Connection conn, UUID transactionId, RemitTransactionStatus status, 
+    		String rejectionReason, BigDecimal tcsAmount) throws Exception {
+    	
+    	if(RemitTransactionStatus.REJECTED.equals(status)) {
+    		String updateTx = "UPDATE remittance_transactions SET status = ?, rejection_reason = ?, updated_at=CURRENT_TIMESTAMP"
+    				+ " WHERE transaction_id = ?";
+            try (PreparedStatement ps = conn.prepareStatement(updateTx)) {
+                ps.setString(1, status.toString());
+                ps.setString(2, rejectionReason);
+                ps.setObject(3, transactionId);
+                ps.executeUpdate();
+            }
+    	}else if(RemitTransactionStatus.APPROVED.equals(status)) {
+    		String updateTx = "UPDATE remittance_transactions SET status = ?, tcs_amount_inr = ?, rejection_reason = '', updated_at=CURRENT_TIMESTAMP "
+    				+ "WHERE transaction_id = ? AND status != ?";
+            try (PreparedStatement ps = conn.prepareStatement(updateTx)) {
+                ps.setString(1, status.toString());
+                ps.setBigDecimal(2, tcsAmount);
+                ps.setObject(3, transactionId);
+                ps.setString(4, RemitTransactionStatus.APPROVED.toString());
+                int rowsUpdated = ps.executeUpdate();
+                if(rowsUpdated == 0) {
+                	throw new IllegalStateException("Approved transaction is incorrectly retried, transactionId : "+transactionId.toString());
+                }
+            }
+    	}
     }
 
    
